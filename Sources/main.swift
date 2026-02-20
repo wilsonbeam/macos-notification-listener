@@ -1,5 +1,7 @@
 import Foundation
 import ArgumentParser
+import ApplicationServices
+import Cocoa
 
 // MARK: - Notification Model
 
@@ -149,6 +151,121 @@ class LogStreamParser {
     }
 }
 
+// MARK: - Accessibility Reader
+
+struct AccessibilityNotificationInfo {
+    let appName: String
+    let title: String
+    let body: String
+}
+
+class AccessibilityReader {
+    /// Find the NotificationCenter process and read notification banner content
+    static func readNotificationBanner() -> AccessibilityNotificationInfo? {
+        guard let ncApp = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == "com.apple.notificationcenterui"
+        }) else {
+            fputs("[ax] NotificationCenter process not found\n", stderr)
+            return nil
+        }
+
+        let axApp = AXUIElementCreateApplication(ncApp.processIdentifier)
+
+        var windowsRef: CFTypeRef?
+        let winResult = AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windowsRef)
+        guard winResult == .success, let windows = windowsRef as? [AXUIElement] else {
+            return nil
+        }
+
+        for window in windows {
+            // Check window title
+            var titleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleRef)
+
+            // Traverse into the window looking for notification groups
+            if let info = traverseForNotification(window) {
+                return info
+            }
+        }
+        return nil
+    }
+
+    /// Poll for notification banner for up to 2 seconds
+    static func pollForNotification() -> AccessibilityNotificationInfo? {
+        for _ in 0..<20 {
+            if let info = readNotificationBanner() {
+                return info
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return nil
+    }
+
+    private static func traverseForNotification(_ element: AXUIElement) -> AccessibilityNotificationInfo? {
+        // Check if this element has a description that looks like "AppName, Title, Body"
+        var descRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXDescriptionAttribute as CFString, &descRef)
+
+        if let desc = descRef as? String, !desc.isEmpty {
+            // Check if it has AXStaticText children (indicates notification group)
+            let texts = getChildStaticTexts(element)
+            if texts.count >= 2 {
+                // Parse description: "AppName, Title, Body"
+                let parts = desc.components(separatedBy: ", ")
+                let appName = parts.count > 0 ? parts[0] : ""
+                // Use child static text values for title/body (more reliable)
+                let title = texts.count > 0 ? texts[0] : (parts.count > 1 ? parts[1] : "")
+                let body = texts.count > 1 ? texts[1] : (parts.count > 2 ? parts[2...].joined(separator: ", ") : "")
+
+                if !title.isEmpty || !body.isEmpty {
+                    return AccessibilityNotificationInfo(appName: appName, title: title, body: body)
+                }
+            } else if desc.contains(", ") {
+                // Fallback: parse from description alone
+                let parts = desc.components(separatedBy: ", ")
+                if parts.count >= 2 {
+                    let appName = parts[0]
+                    let title = parts.count > 1 ? parts[1] : ""
+                    let body = parts.count > 2 ? parts[2...].joined(separator: ", ") : ""
+                    return AccessibilityNotificationInfo(appName: appName, title: title, body: body)
+                }
+            }
+        }
+
+        // Recurse into children
+        var childrenRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef)
+        guard let children = childrenRef as? [AXUIElement] else { return nil }
+
+        for child in children {
+            if let info = traverseForNotification(child) {
+                return info
+            }
+        }
+        return nil
+    }
+
+    private static func getChildStaticTexts(_ element: AXUIElement) -> [String] {
+        var childrenRef: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenRef)
+        guard let children = childrenRef as? [AXUIElement] else { return [] }
+
+        var texts: [String] = []
+        for child in children {
+            var roleRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &roleRef)
+            if let role = roleRef as? String, role == "AXStaticText" {
+                var valueRef: CFTypeRef?
+                AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &valueRef)
+                if let value = valueRef as? String {
+                    texts.append(value)
+                }
+            }
+        }
+        return texts
+    }
+}
+
 // MARK: - Output Manager
 
 class OutputManager {
@@ -249,7 +366,25 @@ struct NotificationListener: ParsableCommand {
             if let filter = appFilter {
                 guard filter.contains(notif.app.lowercased()) || filter.contains(notif.bundleId.lowercased()) else { return }
             }
-            outputManager.emit(notif)
+
+            // Try to enrich with Accessibility API data
+            var enriched = notif
+            DispatchQueue.global(qos: .userInitiated).async {
+                if let axInfo = AccessibilityReader.pollForNotification() {
+                    fputs("[ax] Got notification content: \(axInfo.appName) - \(axInfo.title): \(axInfo.body)\n", stderr)
+                    enriched = CapturedNotification(
+                        timestamp: notif.timestamp,
+                        app: axInfo.appName.isEmpty ? notif.app : axInfo.appName,
+                        bundleId: notif.bundleId,
+                        title: axInfo.title.isEmpty ? notif.title : axInfo.title,
+                        body: axInfo.body.isEmpty ? notif.body : axInfo.body,
+                        identifier: notif.identifier
+                    )
+                } else {
+                    fputs("[ax] Could not read notification banner via Accessibility API\n", stderr)
+                }
+                outputManager.emit(enriched)
+            }
         }
         parser.start()
 
