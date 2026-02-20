@@ -1,6 +1,5 @@
 import Foundation
 import ArgumentParser
-import SQLite3
 
 // MARK: - Notification Model
 
@@ -10,152 +9,147 @@ struct CapturedNotification: Codable {
     let bundleId: String
     let title: String
     let body: String
-    let category: String
+    let identifier: String
 }
 
-// MARK: - SQLite DB Poller
+// MARK: - Log Stream Parser
 
-class NotificationDBPoller {
-    private var lastRowId: Int64 = 0
-    private let dbPath: String?
-
-    init() {
-        dbPath = Self.findNotificationDB()
-        if let path = dbPath {
-            fputs("Using notification DB: \(path)\n", stderr)
-            lastRowId = getMaxRowId() ?? 0
-        } else {
-            fputs("Warning: Could not find notification center database\n", stderr)
-        }
-    }
-
-    static func findNotificationDB() -> String? {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        // macOS stores notification DB in DarwinNotificationCenter or the delivered notifications DB
-        // On macOS Ventura+, delivered notifications are in a per-user db
-        let userNotifDir = "\(home)/Library/Group Containers/group.com.apple.usernotes"
-        if FileManager.default.fileExists(atPath: userNotifDir) {
-            let enumerator = FileManager.default.enumerator(atPath: userNotifDir)
-            while let file = enumerator?.nextObject() as? String {
-                if file.hasSuffix(".db") || file.hasSuffix(".sqlite") {
-                    return "\(userNotifDir)/\(file)"
-                }
-            }
-        }
-
-        // Try macOS Notification Center delivered notifications DB
-        // This is typically at ~/Library/Application Support/NotificationCenter/<uuid>.db  (older macOS)
-        let ncDir = "\(home)/Library/Application Support/NotificationCenter"
-        if FileManager.default.fileExists(atPath: ncDir) {
-            let enumerator = FileManager.default.enumerator(atPath: ncDir)
-            while let file = enumerator?.nextObject() as? String {
-                if file.hasSuffix(".db") || file.hasSuffix(".sqlite") {
-                    return "\(ncDir)/\(file)"
-                }
-            }
-        }
-
-        return nil
-    }
-
-    func getMaxRowId() -> Int64? {
-        guard let dbPath = dbPath else { return nil }
-        var db: OpaquePointer?
-        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
-            return nil
-        }
-        defer { sqlite3_close(db) }
-
-        var stmt: OpaquePointer?
-        // Try common table names
-        let queries = [
-            "SELECT MAX(rowid) FROM record",
-            "SELECT MAX(rowid) FROM delivered",
-            "SELECT MAX(rowid) FROM notifications",
-        ]
-
-        for query in queries {
-            if sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK {
-                if sqlite3_step(stmt) == SQLITE_ROW {
-                    let val = sqlite3_column_int64(stmt, 0)
-                    sqlite3_finalize(stmt)
-                    return val
-                }
-                sqlite3_finalize(stmt)
-            }
-        }
-        return nil
-    }
-
-    func pollNewNotifications() -> [CapturedNotification] {
-        guard let dbPath = dbPath else { return [] }
-        var db: OpaquePointer?
-        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
-            return []
-        }
-        defer { sqlite3_close(db) }
-
-        var results: [CapturedNotification] = []
-        var stmt: OpaquePointer?
-
-        // Try to query with common schemas
-        let query = "SELECT rowid, * FROM record WHERE rowid > ? ORDER BY rowid ASC"
-        if sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK {
-            sqlite3_bind_int64(stmt, 1, lastRowId)
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                let rowid = sqlite3_column_int64(stmt, 0)
-                if rowid > lastRowId { lastRowId = rowid }
-                // Extract columns - schema varies by macOS version
-                let colCount = sqlite3_column_count(stmt)
-                var data: [String: String] = [:]
-                for i in 0..<colCount {
-                    if let name = sqlite3_column_name(stmt, i),
-                       let val = sqlite3_column_text(stmt, i) {
-                        data[String(cString: name)] = String(cString: val)
-                    }
-                }
-                let notif = CapturedNotification(
-                    timestamp: ISO8601DateFormatter().string(from: Date()),
-                    app: data["app"] ?? data["app_id"] ?? "unknown",
-                    bundleId: data["bundle_id"] ?? data["app_id"] ?? "unknown",
-                    title: data["title"] ?? data["titl"] ?? "",
-                    body: data["body"] ?? data["subt"] ?? "",
-                    category: data["category"] ?? data["cat"] ?? ""
-                )
-                results.append(notif)
-            }
-            sqlite3_finalize(stmt)
-        }
-
-        return results
-    }
-}
-
-// MARK: - Distributed Notification Listener
-
-class DistributedNotificationListener {
+class LogStreamParser {
     var handler: ((CapturedNotification) -> Void)?
+    private var process: Process?
+
+    // Regex patterns for extracting notification info
+    // Delivering <NotificationRecord app:"com.example.app" ident:"id123" ...>
+    private let deliveringPattern = try! NSRegularExpression(
+        pattern: #"(?:Delivering|Presenting)\s+<NotificationRecord\s+app:"([^"]+)"\s+ident:"([^"]*)"#
+    )
+    // Connection <bundleId> with path:
+    private let connectionPattern = try! NSRegularExpression(
+        pattern: #"Connection\s+(\S+)\s+with\s+path:"#
+    )
+    // DND resolution with bundleIdentifier:
+    private let dndPattern = try! NSRegularExpression(
+        pattern: #"bundleIdentifier:\s*(\S+)"#
+    )
+    // title/body from NotificationRecord format: title:"..." or title:<hash>
+    private let titlePattern = try! NSRegularExpression(
+        pattern: #"title:(?:"([^"]*)"|\{length\s*=\s*\d+\})"#
+    )
+    private let bodyPattern = try! NSRegularExpression(
+        pattern: #"body:(?:"([^"]*)"|\{length\s*=\s*\d+\})"#
+    )
+    // "processed by pipeline, scheduled for delivery" pattern
+    private let pipelinePattern = try! NSRegularExpression(
+        pattern: #"processed by pipeline.*scheduled for delivery"#
+    )
 
     func start() {
-        DistributedNotificationCenter.default().addObserver(
-            forName: nil,
-            object: nil,
-            queue: .main
-        ) { [weak self] notification in
-            let notif = CapturedNotification(
-                timestamp: ISO8601DateFormatter().string(from: Date()),
-                app: notification.object as? String ?? "unknown",
-                bundleId: notification.name.rawValue,
-                title: notification.name.rawValue,
-                body: (notification.userInfo?.description) ?? "",
-                category: "distributed"
-            )
-            self?.handler?(notif)
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/log")
+        proc.arguments = [
+            "stream",
+            "--predicate", #"process == "usernoted" OR process == "NotificationCenter""#,
+            "--style", "ndjson"
+        ]
+
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = FileHandle.nullDevice
+
+        let handle = pipe.fileHandleForReading
+        handle.readabilityHandler = { [weak self] fh in
+            let data = fh.availableData
+            guard !data.isEmpty else { return }
+            if let text = String(data: data, encoding: .utf8) {
+                for line in text.components(separatedBy: "\n") where !line.isEmpty {
+                    self?.parseLine(line)
+                }
+            }
         }
+
+        do {
+            try proc.run()
+            self.process = proc
+            fputs("log stream started (pid \(proc.processIdentifier))\n", stderr)
+        } catch {
+            fputs("Failed to start log stream: \(error)\n", stderr)
+        }
+    }
+
+    func stop() {
+        process?.terminate()
+        process = nil
+    }
+
+    private func parseLine(_ line: String) {
+        // Try to parse as JSON first
+        guard let data = line.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let eventMessage = json["eventMessage"] as? String else {
+            return
+        }
+
+        let timestamp = (json["timestamp"] as? String) ?? ISO8601DateFormatter().string(from: Date())
+
+        // Check for Delivering/Presenting NotificationRecord
+        let nsMessage = eventMessage as NSString
+        let range = NSRange(location: 0, length: nsMessage.length)
+
+        if let match = deliveringPattern.firstMatch(in: eventMessage, range: range) {
+            let bundleId = nsMessage.substring(with: match.range(at: 1))
+            let ident = nsMessage.substring(with: match.range(at: 2))
+
+            // Try to extract title/body
+            let title = extractCapture(titlePattern, in: eventMessage) ?? ""
+            let body = extractCapture(bodyPattern, in: eventMessage) ?? ""
+
+            let appName = bundleId.components(separatedBy: ".").last ?? bundleId
+
+            let notif = CapturedNotification(
+                timestamp: timestamp,
+                app: appName,
+                bundleId: bundleId,
+                title: title,
+                body: body,
+                identifier: ident
+            )
+            handler?(notif)
+            return
+        }
+
+        // Check for pipeline delivery pattern
+        if pipelinePattern.firstMatch(in: eventMessage, range: range) != nil {
+            // Try to find bundleId from the message
+            if let bundleMatch = dndPattern.firstMatch(in: eventMessage, range: range) {
+                let bundleId = nsMessage.substring(with: bundleMatch.range(at: 1))
+                let appName = bundleId.components(separatedBy: ".").last ?? bundleId
+                let notif = CapturedNotification(
+                    timestamp: timestamp,
+                    app: appName,
+                    bundleId: bundleId,
+                    title: "",
+                    body: "",
+                    identifier: ""
+                )
+                handler?(notif)
+            }
+            return
+        }
+    }
+
+    private func extractCapture(_ regex: NSRegularExpression, in text: String) -> String? {
+        let ns = text as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        guard let match = regex.firstMatch(in: text, range: range) else { return nil }
+        // Try group 1 (quoted value)
+        if match.range(at: 1).location != NSNotFound {
+            return ns.substring(with: match.range(at: 1))
+        }
+        return nil
     }
 }
 
-// MARK: - Output Handlers
+// MARK: - Output Manager
 
 class OutputManager {
     let webhookURL: URL?
@@ -169,9 +163,7 @@ class OutputManager {
         self.outputFile = outputFile
         self.useStdout = useStdout
         encoder.outputFormatting = [.sortedKeys]
-        encoder.dateEncodingStrategy = .iso8601
 
-        // Ensure output directory exists
         if let outputFile = outputFile {
             let dir = (outputFile as NSString).deletingLastPathComponent
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -182,13 +174,11 @@ class OutputManager {
         guard let jsonData = try? encoder.encode(notification),
               let jsonString = String(data: jsonData, encoding: .utf8) else { return }
 
-        // stdout
         if useStdout {
             print(jsonString)
             fflush(stdout)
         }
 
-        // File
         if let outputFile = outputFile {
             let line = jsonString + "\n"
             if let handle = FileHandle(forWritingAtPath: outputFile) {
@@ -200,7 +190,6 @@ class OutputManager {
             }
         }
 
-        // Webhook
         if let url = webhookURL, let jsonData = try? encoder.encode(notification) {
             var request = URLRequest(url: url)
             request.httpMethod = "POST"
@@ -217,7 +206,7 @@ class OutputManager {
 struct NotificationListener: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "notification-listener",
-        abstract: "Capture macOS notifications from all apps and output as JSON lines."
+        abstract: "Capture macOS notifications via log stream and output as JSON lines."
     )
 
     @Flag(name: .long, help: "Run as background daemon")
@@ -232,10 +221,7 @@ struct NotificationListener: ParsableCommand {
     @Flag(name: .long, help: "Stream JSON lines to stdout")
     var stdout = false
 
-    @Option(name: .long, help: "Poll interval in seconds for DB polling")
-    var pollInterval: Double = 2.0
-
-    @Option(name: .long, help: "Filter by app name (comma-separated)")
+    @Option(name: .long, help: "Filter by app bundle ID or name (comma-separated)")
     var filterApps: String?
 
     func run() throws {
@@ -253,39 +239,20 @@ struct NotificationListener: ParsableCommand {
             Set($0.split(separator: ",").map { String($0).trimmingCharacters(in: .whitespaces).lowercased() })
         }
 
-        fputs("notification-listener starting...\n", stderr)
+        fputs("notification-listener starting (log stream mode)...\n", stderr)
         fputs("Output file: \(effectiveOutput)\n", stderr)
         if let url = webhookURL { fputs("Webhook: \(url)\n", stderr) }
         fputs("Stdout: \(useStdout)\n", stderr)
 
-        let emitFiltered: (CapturedNotification) -> Void = { notif in
+        let parser = LogStreamParser()
+        parser.handler = { notif in
             if let filter = appFilter {
                 guard filter.contains(notif.app.lowercased()) || filter.contains(notif.bundleId.lowercased()) else { return }
             }
             outputManager.emit(notif)
         }
+        parser.start()
 
-        // Start distributed notification listener
-        let distListener = DistributedNotificationListener()
-        distListener.handler = emitFiltered
-        distListener.start()
-        fputs("Listening for distributed notifications...\n", stderr)
-
-        // Start DB poller
-        let poller = NotificationDBPoller()
-
-        // Set up polling timer
-        let timer = DispatchSource.makeTimerSource(queue: .global())
-        timer.schedule(deadline: .now() + pollInterval, repeating: pollInterval)
-        timer.setEventHandler {
-            let newNotifs = poller.pollNewNotifications()
-            for notif in newNotifs {
-                emitFiltered(notif)
-            }
-        }
-        timer.resume()
-
-        // Handle SIGINT/SIGTERM gracefully
         signal(SIGINT) { _ in
             fputs("\nShutting down...\n", stderr)
             Darwin.exit(0)
@@ -295,7 +262,6 @@ struct NotificationListener: ParsableCommand {
             Darwin.exit(0)
         }
 
-        // Run the runloop
         RunLoop.main.run()
     }
 }
